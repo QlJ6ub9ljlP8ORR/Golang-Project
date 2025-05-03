@@ -12,6 +12,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"mini_etcd/config"
 	"mini_etcd/internal/kv"
 	"mini_etcd/internal/raft"
 )
@@ -100,6 +101,324 @@ func buildCluster(t *testing.T, n int) ([]*raft.Node, func()) {
 	}
 
 	return nodes, stop
+}
+
+// ---------------------------------------------------------------------
+//
+//	UNIT: cluster creation
+//
+// --------------------------------------------------------------------
+func TestClusterCreation(t *testing.T) {
+	// Test invalid cluster size
+	_, _, err := buildClusterWithSize(t, 0)
+	if err == nil {
+		t.Error("expected error when creating cluster with size 0")
+	}
+
+	_, _, err = buildClusterWithSize(t, -1)
+	if err == nil {
+		t.Error("expected error when creating cluster with negative size")
+	}
+
+	// Test valid cluster creation
+	nodes, stop, err := buildClusterWithSize(t, 3)
+	if err != nil {
+		t.Fatalf("create cluster: %v", err)
+	}
+	defer stop()
+
+	// Verify node states
+	for _, n := range nodes {
+		if n.State() != raft.Follower {
+			t.Errorf("node %s not in follower state", n.ID())
+		}
+	}
+}
+
+// ---------------------------------------------------------------------
+//
+//	INTEGRATION: cluster operations
+//
+// --------------------------------------------------------------------
+func TestClusterOperations(t *testing.T) {
+	nodes, stop := buildCluster(t, 3)
+	defer stop()
+
+	// wait for election
+	time.Sleep(3 * time.Second)
+
+	// find leader
+	var leader *raft.Node
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			leader = n
+			break
+		}
+	}
+	if leader == nil {
+		t.Fatalf("no leader")
+	}
+
+	// Test invalid propose
+	_, _, err := leader.Propose(nil)
+	if err == nil {
+		t.Error("expected error when proposing nil command")
+	}
+
+	// Test valid propose
+	_, ok, err := leader.Propose(kv.SetCmd{Key: "k1", Value: "v1"})
+	if err != nil {
+		t.Fatalf("propose error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("propose failed")
+	}
+
+	// wait for apply
+	for leader.LastApplied() < 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Test invalid stop
+	err = leader.Stop()
+	if err == nil {
+		t.Error("expected error when stopping already stopped node")
+	}
+
+	// stop leader
+	leader.Stop()
+
+	// wait for new election
+	time.Sleep(3 * time.Second)
+
+	// find new leader
+	var newLeader *raft.Node
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			newLeader = n
+			break
+		}
+	}
+	if newLeader == nil {
+		t.Fatalf("no new leader")
+	}
+
+	// Test invalid propose
+	_, _, err = newLeader.Propose(nil)
+	if err == nil {
+		t.Error("expected error when proposing nil command")
+	}
+
+	// Test valid propose
+	_, ok, err = newLeader.Propose(kv.SetCmd{Key: "k2", Value: "v2"})
+	if err != nil {
+		t.Fatalf("propose error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("propose failed")
+	}
+
+	// wait for apply
+	for newLeader.LastApplied() < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// ---------------------------------------------------------------------
+//
+//	INTEGRATION: cluster recovery
+//
+// --------------------------------------------------------------------
+func TestClusterRecovery(t *testing.T) {
+	nodes, stop := buildCluster(t, 3)
+	defer stop()
+
+	// wait for election
+	time.Sleep(3 * time.Second)
+
+	// find leader
+	var leader *raft.Node
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			leader = n
+			break
+		}
+	}
+	if leader == nil {
+		t.Fatalf("no leader")
+	}
+
+	// Test invalid propose
+	_, _, err := leader.Propose(nil)
+	if err == nil {
+		t.Error("expected error when proposing nil command")
+	}
+
+	// Test valid propose
+	_, ok, err := leader.Propose(kv.SetCmd{Key: "k1", Value: "v1"})
+	if err != nil {
+		t.Fatalf("propose error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("propose failed")
+	}
+
+	// wait for apply
+	for leader.LastApplied() < 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// stop leader
+	leader.Stop()
+
+	// wait for new election
+	time.Sleep(3 * time.Second)
+
+	// find new leader
+	var newLeader *raft.Node
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			newLeader = n
+			break
+		}
+	}
+	if newLeader == nil {
+		t.Fatalf("no new leader")
+	}
+
+	// Test invalid propose
+	_, _, err = newLeader.Propose(nil)
+	if err == nil {
+		t.Error("expected error when proposing nil command")
+	}
+
+	// Test valid propose
+	_, ok, err = newLeader.Propose(kv.SetCmd{Key: "k2", Value: "v2"})
+	if err != nil {
+		t.Fatalf("propose error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("propose failed")
+	}
+
+	// wait for apply
+	for newLeader.LastApplied() < 2 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// restart old leader
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "node.bolt")
+	db, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open bolt: %v", err)
+	}
+	store, err := raft.NewBoltStore(db)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	log, err := raft.NewBoltLog(db)
+	if err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	// Test invalid node creation
+	_, err = raft.NewNode("", store, log, nil)
+	if err == nil {
+		t.Error("expected error when creating node with empty ID")
+	}
+
+	_, err = raft.NewNode("n1", nil, log, nil)
+	if err == nil {
+		t.Error("expected error when creating node with nil store")
+	}
+
+	_, err = raft.NewNode("n1", store, nil, nil)
+	if err == nil {
+		t.Error("expected error when creating node with nil log")
+	}
+
+	// Create valid node
+	recovered, err := raft.NewNode(leader.ID(), store, log, nil)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	// Test invalid start
+	err = recovered.Start("")
+	if err == nil {
+		t.Error("expected error when starting with empty address")
+	}
+
+	// Start node
+	err = recovered.Start(":0")
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	defer recovered.Stop()
+
+	// wait for recovery
+	time.Sleep(3 * time.Second)
+
+	// should be follower
+	if recovered.State() != raft.Follower {
+		t.Fatalf("recovered node not in follower state")
+	}
+}
+
+// ---------------------------------------------------------------------
+//
+//	UNIT: cluster helper functions
+//
+// --------------------------------------------------------------------
+func TestClusterHelpers(t *testing.T) {
+	// Test invalid cluster size
+	_, _, err := buildClusterWithSize(t, 0)
+	if err == nil {
+		t.Error("expected error when creating cluster with size 0")
+	}
+
+	_, _, err = buildClusterWithSize(t, -1)
+	if err == nil {
+		t.Error("expected error when creating cluster with negative size")
+	}
+
+	// Test valid cluster creation
+	nodes, stop, err := buildClusterWithSize(t, 3)
+	if err != nil {
+		t.Fatalf("create cluster: %v", err)
+	}
+	defer stop()
+
+	// Verify node states
+	for _, n := range nodes {
+		if n.State() != raft.Follower {
+			t.Errorf("node %s not in follower state", n.ID())
+		}
+	}
+
+	// Test invalid node creation
+	_, err = raft.NewNode("", nil, nil, nil)
+	if err == nil {
+		t.Error("expected error when creating node with empty ID")
+	}
+
+	_, err = raft.NewNode("n1", nil, nil, nil)
+	if err == nil {
+		t.Error("expected error when creating node with nil store")
+	}
+
+	// Test invalid start
+	err = nodes[0].Start("")
+	if err == nil {
+		t.Error("expected error when starting with empty address")
+	}
+
+	// Test invalid stop
+	err = nodes[0].Stop()
+	if err == nil {
+		t.Error("expected error when stopping already stopped node")
+	}
 }
 
 // --------------------------------------------------
