@@ -2,6 +2,7 @@ package raft
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"math/rand"
 	"net/http"
@@ -102,30 +103,38 @@ func (n *Node) Start() {
 func (n *Node) Stop() { close(n.stopCh) }
 
 // Propose replicates a command **only the leader**.
-func (n *Node) Propose(cmd any) (idx int, ok bool) {
+func (n *Node) Propose(cmd any) (idx int, ok bool, err error) {
 	n.mu.Lock()
 	if n.state != Leader {
 		n.mu.Unlock()
-		return -1, false
+		return -1, false, fmt.Errorf("not leader")
 	}
+	
+	if cmd == nil {
+		n.mu.Unlock()
+		return -1, false, fmt.Errorf("command cannot be nil")
+	}
+	
 	idx = n.log.Append(LogEntry{Term: n.currentTerm, Command: cmd})
 
 	// ---------- single-node fast commit ----------------
 	if len(n.peers) == 0 {
 		n.commitIndex = idx
 		n.applyCommitted() // apply locally
-		n.maybePrune()
+		if err := n.maybePrune(); err != nil {
+			n.mu.Unlock()
+			return -1, false, fmt.Errorf("failed to prune log: %w", err)
+		}
 
 		n.mu.Unlock()
-
-		return idx, true
+		return idx, true, nil
 	}
 	// ---------------------------------------------------
 
 	n.mu.Unlock()
 
 	go n.broadcastAppendEntries()
-	return idx, true
+	return idx, true, nil
 }
 
 // ------------------------------------------------------------
@@ -279,7 +288,7 @@ func (n *Node) becomeLeader() {
 }
 
 func (n *Node) broadcastAppendEntries() {
-	// capture a *snapshot* of leader’s state under read-lock
+	// capture a *snapshot* of leader's state under read-lock
 	n.mu.RLock()
 	if n.state != Leader {
 		n.mu.RUnlock()
@@ -453,24 +462,31 @@ func min_(a, b int) int {
 	return b
 }
 
-func (n *Node) applyCommitted() {
+func (n *Node) applyCommitted() error {
 	for n.lastApplied < n.commitIndex {
 		n.lastApplied++
 		if e, ok := n.log.At(n.lastApplied); ok {
-			n.applyCh <- ApplyMsg{CommandValid: true, Command: e.Command,
-				CommandIndex: n.lastApplied}
-			n.store.SetLastApplied(n.lastApplied)
+			select {
+			case n.applyCh <- ApplyMsg{CommandValid: true, Command: e.Command, CommandIndex: n.lastApplied}:
+				n.store.SetLastApplied(n.lastApplied)
+			default:
+				return fmt.Errorf("apply channel is full")
+			}
 		}
 	}
+	return nil
 }
 
-func (n *Node) maybePrune() {
+func (n *Node) maybePrune() error {
 	if n.commitIndex-n.log.FirstIndex() > config.PruneEvery {
 		cutoff := n.commitIndex - config.RetainTail
 		if cutoff > n.log.FirstIndex() {
-			n.log.TruncateBefore(cutoff)
+			if err := n.log.TruncateBefore(cutoff); err != nil {
+				return fmt.Errorf("failed to truncate log: %w", err)
+			}
 		}
 	}
+	return nil
 }
 
 // ------------------------------------------------------------
@@ -478,17 +494,24 @@ func (n *Node) maybePrune() {
 // ------------------------------------------------------------
 
 func (n *Node) handleInbound(method transport.RPC, body io.Reader, w http.ResponseWriter) {
+	var err error
 	switch method {
 	case transport.RPCRequestVote:
 		var args RequestVoteArgs
-		_ = json.NewDecoder(body).Decode(&args)
+		if err := json.NewDecoder(body).Decode(&args); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
 		transport.ReplyJSON(w, n.onRequestVote(&args))
 	case transport.RPCAppendEntries:
 		var args AppendEntriesArgs
-		_ = json.NewDecoder(body).Decode(&args)
+		if err := json.NewDecoder(body).Decode(&args); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
 		transport.ReplyJSON(w, n.onAppendEntries(&args))
 	default:
-		w.WriteHeader(http.StatusNotFound)
+		http.Error(w, "unknown RPC method", http.StatusNotFound)
 	}
 }
 
