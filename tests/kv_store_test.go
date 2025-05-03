@@ -23,7 +23,10 @@ func newTempStore(t *testing.T, cacheSize int) (*kv.Store, func()) {
 	if err != nil {
 		t.Fatalf("open bolt: %v", err)
 	}
-	s := kv.New(db, cacheSize)
+	s, err := kv.New(db, cacheSize)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
 	return s, func() { s.Close() }
 }
 
@@ -35,16 +38,49 @@ func TestStoreBasicOps(t *testing.T) {
 	s, clean := newTempStore(t, 10)
 	defer clean()
 
-	// set
-	s.Apply(kv.SetCmd{Key: "foo", Value: "bar"})
-	if got := s.Get("foo"); got != "bar" {
-		t.Fatalf("want bar, got %q", got)
+	// Test invalid key
+	_, err := s.Get("")
+	if err != kv.ErrInvalidKey {
+		t.Errorf("expected ErrInvalidKey for empty key, got %v", err)
 	}
 
-	// delete
-	s.Apply(kv.DelCmd{Key: "foo"})
-	if got := s.Get("foo"); got != "" {
-		t.Fatalf("delete failed, got %q", got)
+	// Test invalid value
+	_, err = s.Apply(kv.SetCmd{Key: "foo", Value: ""})
+	if err != kv.ErrInvalidValue {
+		t.Errorf("expected ErrInvalidValue for empty value, got %v", err)
+	}
+
+	// Test valid set
+	_, err = s.Apply(kv.SetCmd{Key: "foo", Value: "bar"})
+	if err != nil {
+		t.Errorf("unexpected error on set: %v", err)
+	}
+
+	// Test get
+	val, err := s.Get("foo")
+	if err != nil {
+		t.Errorf("unexpected error on get: %v", err)
+	}
+	if val != "bar" {
+		t.Errorf("want bar, got %q", val)
+	}
+
+	// Test get non-existent
+	val, err = s.Get("nonexistent")
+	if err != kv.ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound, got %v", err)
+	}
+
+	// Test delete
+	_, err = s.Apply(kv.DelCmd{Key: "foo"})
+	if err != nil {
+		t.Errorf("unexpected error on delete: %v", err)
+	}
+
+	// Test get after delete
+	val, err = s.Get("foo")
+	if err != kv.ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound after delete, got %v", err)
 	}
 }
 
@@ -56,13 +92,26 @@ func TestStoreLRUEviction(t *testing.T) {
 	defer clean()
 
 	// fill three keys
-	s.Apply(kv.SetCmd{Key: "a", Value: "1"})
-	s.Apply(kv.SetCmd{Key: "b", Value: "2"})
-	s.Apply(kv.SetCmd{Key: "c", Value: "3"}) // evicts "a"
+	_, err := s.Apply(kv.SetCmd{Key: "a", Value: "1"})
+	if err != nil {
+		t.Errorf("unexpected error on set a: %v", err)
+	}
+	_, err = s.Apply(kv.SetCmd{Key: "b", Value: "2"})
+	if err != nil {
+		t.Errorf("unexpected error on set b: %v", err)
+	}
+	_, err = s.Apply(kv.SetCmd{Key: "c", Value: "3"}) // evicts "a"
+	if err != nil {
+		t.Errorf("unexpected error on set c: %v", err)
+	}
 
 	// "a" must trigger Bolt hit (cache miss) but still return correct value
-	if got := s.Get("a"); got != "1" {
-		t.Fatalf("LRU eviction wrong, want 1 got %q", got)
+	val, err := s.Get("a")
+	if err != nil {
+		t.Errorf("unexpected error on get a: %v", err)
+	}
+	if val != "1" {
+		t.Errorf("LRU eviction wrong, want 1 got %q", val)
 	}
 }
 
@@ -73,18 +122,43 @@ func TestStorePersistence(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "kv.bolt")
 
-	db, _ := bolt.Open(dbPath, 0600, nil)
-	store1 := kv.New(db, 5)
-	store1.Apply(kv.SetCmd{Key: "x", Value: "y"})
-	store1.Close()
+	db, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open bolt: %v", err)
+	}
+	store1, err := kv.New(db, 5)
+	if err != nil {
+		t.Fatalf("create store1: %v", err)
+	}
+	_, err = store1.Apply(kv.SetCmd{Key: "x", Value: "y"})
+	if err != nil {
+		t.Errorf("unexpected error on set: %v", err)
+	}
+	err = store1.Close()
+	if err != nil {
+		t.Errorf("unexpected error on close: %v", err)
+	}
 
 	// reopen same file
-	db2, _ := bolt.Open(dbPath, 0600, nil)
-	store2 := kv.New(db2, 5)
-	if got := store2.Get("x"); got != "y" {
-		t.Fatalf("persistence lost: want y got %q", got)
+	db2, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open bolt2: %v", err)
 	}
-	store2.Close()
+	store2, err := kv.New(db2, 5)
+	if err != nil {
+		t.Fatalf("create store2: %v", err)
+	}
+	val, err := store2.Get("x")
+	if err != nil {
+		t.Errorf("unexpected error on get: %v", err)
+	}
+	if val != "y" {
+		t.Errorf("persistence lost: want y got %q", val)
+	}
+	err = store2.Close()
+	if err != nil {
+		t.Errorf("unexpected error on close: %v", err)
+	}
 }
 
 // ---------------------------------------------------------
@@ -101,18 +175,88 @@ func TestStoreConcurrent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			key := "k" + string(rune(i))
-			s.Apply(kv.SetCmd{Key: key, Value: "v"})
-			if got := s.Get(key); got != "v" {
+			_, err := s.Apply(kv.SetCmd{Key: key, Value: "v"})
+			if err != nil {
+				t.Errorf("unexpected error on set: %v", err)
+				return
+			}
+			val, err := s.Get(key)
+			if err != nil {
+				t.Errorf("unexpected error on get: %v", err)
+				return
+			}
+			if val != "v" {
 				t.Errorf("concurrent get failed for %s", key)
 			}
-			s.Apply(kv.DelCmd{Key: key})
+			_, err = s.Apply(kv.DelCmd{Key: key})
+			if err != nil {
+				t.Errorf("unexpected error on delete: %v", err)
+			}
 		}()
 	}
 	wg.Wait()
 
 	// small delay to ensure deletes flushed
 	time.Sleep(50 * time.Millisecond)
-	if got := s.Get("k0"); got != "" {
-		t.Fatalf("expected empty after delete, got %q", got)
+	val, err := s.Get("k0")
+	if err != kv.ErrKeyNotFound {
+		t.Errorf("expected ErrKeyNotFound after delete, got %v", err)
+	}
+	if val != "" {
+		t.Errorf("expected empty after delete, got %q", val)
+	}
+}
+
+// ---------------------------------------------------------
+//  5. store closed operations
+// ---------------------------------------------------------
+func TestStoreClosed(t *testing.T) {
+	s, _ := newTempStore(t, 10)
+	s.Close()
+
+	// Test operations after close
+	_, err := s.Get("key")
+	if err != kv.ErrStoreClosed {
+		t.Errorf("expected ErrStoreClosed on get, got %v", err)
+	}
+
+	_, err = s.Apply(kv.SetCmd{Key: "key", Value: "value"})
+	if err != kv.ErrStoreClosed {
+		t.Errorf("expected ErrStoreClosed on set, got %v", err)
+	}
+
+	_, err = s.Apply(kv.DelCmd{Key: "key"})
+	if err != kv.ErrStoreClosed {
+		t.Errorf("expected ErrStoreClosed on delete, got %v", err)
+	}
+
+	// Test double close
+	err = s.Close()
+	if err != kv.ErrStoreClosed {
+		t.Errorf("expected ErrStoreClosed on second close, got %v", err)
+	}
+}
+
+// ---------------------------------------------------------
+//  6. invalid store creation
+// ---------------------------------------------------------
+func TestStoreInvalidCreation(t *testing.T) {
+	// Test nil database
+	_, err := kv.New(nil, 10)
+	if err == nil {
+		t.Error("expected error for nil database")
+	}
+
+	// Test invalid cache size
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "kv.bolt")
+	db, _ := bolt.Open(dbPath, 0600, nil)
+	_, err = kv.New(db, 0)
+	if err == nil {
+		t.Error("expected error for zero cache size")
+	}
+	_, err = kv.New(db, -1)
+	if err == nil {
+		t.Error("expected error for negative cache size")
 	}
 }
