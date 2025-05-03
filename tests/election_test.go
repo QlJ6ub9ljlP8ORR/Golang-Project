@@ -8,6 +8,7 @@ import (
 
 	bolt "go.etcd.io/bbolt"
 
+	"mini_etcd/config"
 	"mini_etcd/internal/kv"
 	"mini_etcd/internal/raft"
 )
@@ -123,6 +124,304 @@ func TestLeaderRestartWithDisk(t *testing.T) {
 		t.Fatalf("persisted entry missing after restart")
 	}
 	db2.Close()
+}
+
+// ---------------------------------------------------------------------
+//
+//	UNIT: election timeout
+//
+// --------------------------------------------------------------------
+func TestElectionTimeout(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "node.bolt")
+	db, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open bolt: %v", err)
+	}
+	store, err := raft.NewBoltStore(db)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	log, err := raft.NewBoltLog(db)
+	if err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	// Test invalid node creation
+	_, err = raft.NewNode("", store, log, nil)
+	if err == nil {
+		t.Error("expected error when creating node with empty ID")
+	}
+
+	_, err = raft.NewNode("n1", nil, log, nil)
+	if err == nil {
+		t.Error("expected error when creating node with nil store")
+	}
+
+	_, err = raft.NewNode("n1", store, nil, nil)
+	if err == nil {
+		t.Error("expected error when creating node with nil log")
+	}
+
+	// Create valid node
+	node, err := raft.NewNode("n1", store, log, nil)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	// Test invalid start
+	err = node.Start("")
+	if err == nil {
+		t.Error("expected error when starting with empty address")
+	}
+
+	// Start node
+	err = node.Start(":0")
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	defer node.Stop()
+
+	// wait for election timeout
+	time.Sleep(config.ElectionTimeout + 100*time.Millisecond)
+
+	// should be leader
+	if node.State() != raft.Leader {
+		t.Fatalf("node did not become leader after timeout")
+	}
+
+	// Test invalid propose
+	_, _, err = node.Propose(nil)
+	if err == nil {
+		t.Error("expected error when proposing nil command")
+	}
+
+	// Test valid propose
+	_, ok, err := node.Propose(raft.NoOp)
+	if err != nil {
+		t.Fatalf("propose error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("propose failed")
+	}
+}
+
+// ---------------------------------------------------------------------
+//
+//	INTEGRATION: 3-node election
+//
+// --------------------------------------------------------------------
+func TestThreeNodeElection(t *testing.T) {
+	nodes, stop := buildCluster(t, 3)
+	defer stop()
+
+	// wait for election
+	time.Sleep(3 * time.Second)
+
+	// exactly one leader
+	leaders := 0
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("want 1 leader, got %d", leaders)
+	}
+
+	// find leader
+	var leader *raft.Node
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			leader = n
+			break
+		}
+	}
+
+	// Test invalid propose
+	_, _, err := leader.Propose(nil)
+	if err == nil {
+		t.Error("expected error when proposing nil command")
+	}
+
+	// Test valid propose
+	_, ok, err := leader.Propose(raft.NoOp)
+	if err != nil {
+		t.Fatalf("propose error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("propose failed")
+	}
+
+	// wait for apply
+	for leader.LastApplied() < 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// Test invalid stop
+	err = leader.Stop()
+	if err == nil {
+		t.Error("expected error when stopping already stopped node")
+	}
+
+	// stop leader
+	leader.Stop()
+
+	// wait for new election
+	time.Sleep(3 * time.Second)
+
+	// exactly one new leader
+	leaders = 0
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("want 1 leader after stop, got %d", leaders)
+	}
+}
+
+// ---------------------------------------------------------------------
+//
+//	INTEGRATION: 5-node election
+//
+// --------------------------------------------------------------------
+func TestFiveNodeElection(t *testing.T) {
+	nodes, stop := buildCluster(t, 5)
+	defer stop()
+
+	// wait for election
+	time.Sleep(3 * time.Second)
+
+	// exactly one leader
+	leaders := 0
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("want 1 leader, got %d", leaders)
+	}
+
+	// find leader
+	var leader *raft.Node
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			leader = n
+			break
+		}
+	}
+
+	// Test invalid propose
+	_, _, err := leader.Propose(nil)
+	if err == nil {
+		t.Error("expected error when proposing nil command")
+	}
+
+	// Test valid propose
+	_, ok, err := leader.Propose(raft.NoOp)
+	if err != nil {
+		t.Fatalf("propose error: %v", err)
+	}
+	if !ok {
+		t.Fatalf("propose failed")
+	}
+
+	// wait for apply
+	for leader.LastApplied() < 1 {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// stop leader
+	leader.Stop()
+
+	// wait for new election
+	time.Sleep(3 * time.Second)
+
+	// exactly one new leader
+	leaders = 0
+	for _, n := range nodes {
+		if n.State() == raft.Leader {
+			leaders++
+		}
+	}
+	if leaders != 1 {
+		t.Fatalf("want 1 leader after stop, got %d", leaders)
+	}
+}
+
+// ---------------------------------------------------------------------
+//
+//	UNIT: node state transitions
+//
+// --------------------------------------------------------------------
+func TestNodeStateTransitions(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "node.bolt")
+	db, err := bolt.Open(dbPath, 0600, nil)
+	if err != nil {
+		t.Fatalf("open bolt: %v", err)
+	}
+	store, err := raft.NewBoltStore(db)
+	if err != nil {
+		t.Fatalf("create store: %v", err)
+	}
+	log, err := raft.NewBoltLog(db)
+	if err != nil {
+		t.Fatalf("create log: %v", err)
+	}
+
+	// Create node
+	node, err := raft.NewNode("n1", store, log, nil)
+	if err != nil {
+		t.Fatalf("create node: %v", err)
+	}
+
+	// Test invalid state transitions
+	err = node.SetState(raft.Leader)
+	if err == nil {
+		t.Error("expected error when setting state before start")
+	}
+
+	// Start node
+	err = node.Start(":0")
+	if err != nil {
+		t.Fatalf("start node: %v", err)
+	}
+	defer node.Stop()
+
+	// Test invalid state
+	err = node.SetState(raft.State(999))
+	if err == nil {
+		t.Error("expected error when setting invalid state")
+	}
+
+	// Test valid state transitions
+	err = node.SetState(raft.Follower)
+	if err != nil {
+		t.Fatalf("set follower state: %v", err)
+	}
+	if node.State() != raft.Follower {
+		t.Fatalf("state not set to follower")
+	}
+
+	err = node.SetState(raft.Candidate)
+	if err != nil {
+		t.Fatalf("set candidate state: %v", err)
+	}
+	if node.State() != raft.Candidate {
+		t.Fatalf("state not set to candidate")
+	}
+
+	err = node.SetState(raft.Leader)
+	if err != nil {
+		t.Fatalf("set leader state: %v", err)
+	}
+	if node.State() != raft.Leader {
+		t.Fatalf("state not set to leader")
+	}
 }
 
 /*=========================================================
